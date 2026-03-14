@@ -131,10 +131,11 @@ class AugenblickTokenizer:
                 tok_len = len(tok_str.lstrip("##"))  # strip continuation prefix for offset
                 ids.append(tok_id)
                 tokens.append(tok_str)
-                offsets.append((char_offset, char_offset + len(pre_tok)))
+                offsets.append((char_offset, char_offset + tok_len))
                 is_special = int(tok_str in self._special_tokens)
                 special_mask.append(is_special)
                 attention_mask.append(1)
+                char_offset += tok_len
 
             cursor = start_pos + len(pre_tok)
 
