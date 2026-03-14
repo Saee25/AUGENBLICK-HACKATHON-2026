@@ -1,24 +1,3 @@
-Here is your **cleaned and consistently formatted `.md` content**.
-I **did not change the content**, only fixed:
-
-* heading hierarchy
-* horizontal rules
-* code block formatting
-* tables
-* spacing
-* consistent Markdown syntax
-* removed HTML artifacts
-* ensured valid fenced code blocks
-
-You can **copy this directly into a `.md` file**.
-
----
-
-````markdown
-# Tokenizer Pipeline Trace and Architecture Analysis
-
----
-
 # Task 1 — Tokenization Pipeline Trace
 
 ## What We Did
@@ -747,9 +726,6 @@ tokenization
 Each model assumes something different about language:
 Here is your section **cleaned and formatted consistently** with the same style as before (proper headings, code blocks, spacing, and tables).
 
-You can paste this directly into your `.md` file.
-
-```markdown
 | Model     | Assumption                                   |
 |----------|-----------------------------------------------|
 | WordLevel | Language = dictionary words                  |
@@ -878,10 +854,260 @@ If tokenization is poor:
 A good tokenizer converts messy real-world text into **consistent, meaningful building blocks**.
 
 Those building blocks are what allow language models to understand and generate text effectively.
+
+
+# Task 16 — Is This Ready for Production?
+
+Imagine deploying **abctokz** as the tokenizer for a system that processes **millions of Hindi and English documents per day**. Below is a short audit of whether it feels production-ready.
+
+---
+
+# Why I'd Feel Confident Deploying It
+
+## 1. Deterministic Output
+
+The tokenizer produces the **same result every time for the same input**.  
+This is important because production systems need reproducible behavior.
+
+For example, calling `encode()` multiple times on the same text produced the **exact same token IDs each time**.
+
+**Evidence**
+
+- `tests/test_determinism.py`
+- `set_seed(config.seed)` in `bpe_trainer.py`
+
+---
+
+## 2. Proper Handling of Devanagari Text
+
+The project includes **Devanagari-aware normalization and tokenization**, which is important when working with Hindi text.
+
+It uses **NFC normalization**, which keeps characters like conjuncts intact and avoids breaking words incorrectly.
+
+Example:
+
+```
+Café  →  Café
 ```
 
+**Evidence**
 
-AI Tools Used:
+- `src/abctokz/normalizers/devanagari.py`
+
+This makes the tokenizer safer for **multilingual and Indic-language text**.
+
+---
+
+## 3. Clear Error Handling and Versioning
+
+The project includes a **custom exception system** and checks the tokenizer schema version when loading artifacts.
+
+If the saved tokenizer format changes, a clear error (`SchemaVersionError`) is raised instead of silently failing.
+
+**Evidence**
+
+- `exceptions.py`
+- `version.py` (`SCHEMA_VERSION = 1`)
+
+This is useful for **safe deployment and upgrades**.
+
+---
+
+# Why I'd Be Hesitant
+
+## 1. Tokenizer Save/Load Does Not Save the Full Pipeline
+
+Currently, the saved tokenizer configuration only stores minimal information like:
+
+```
+{
+  "model_type": "bpe",
+  "schema_version": "1"
+}
+```
+
+It does **not store the normalizer or pre-tokenizer configuration**.
+
+This means a tokenizer loaded from disk may behave slightly differently from the one that was trained.
+
+**Evidence**
+
+- `tokenizer.py` (save/load logic)
+
+This would be risky in production because tokenization should always be reproducible.
+
+---
+
+## 2. Batch Encoding Is Not Parallel
+
+The `encode_batch()` function processes inputs using a simple loop.
+
+Conceptually it looks like:
+
+```
+[tokenizer.encode(x) for x in texts]
+```
+
+For very large datasets, this could become a **performance bottleneck**.
+
+**Evidence**
+
+- `tokenizer.py` (`encode_batch` implementation)
+
+---
+
+## 3. Special Token Handling in Decode Is Simple
+
+The `decode()` function removes tokens that look like `<token>` using a simple rule.
+
+This may accidentally remove valid tokens or miss some special tokens.
+
+**Evidence**
+
+- `tokenizer.py` (decode logic)
+
+A safer approach would be to check against the **registered list of special tokens**.
+
+---
+
+# Most Important Thing to Fix First
+
+The **highest priority issue** would be improving the `save()` and `load()` system so that the entire tokenizer pipeline is saved and restored correctly.
+
+This would ensure that a tokenizer behaves **exactly the same across different machines and deployments**, which is critical in production systems.
+
+# Task 17 — One Small Improvement: Fixing Token Offsets in Tokenizer
+
+## What is a Token Offset?
+
+In tokenization, a **token offset** is a pair of integers `(start, end)` that indicates the character positions in the original input string where a specific token originates. For example, if the input text is "hello world" and it produces tokens ["hello", "world"], the offsets might be [(0, 5), (6, 11)], meaning "hello" spans characters 0-4 and "world" spans 6-10.
+
+Offsets are crucial for applications that need to map tokens back to the original text, such as:
+- Highlighting tokens in user interfaces
+- Aligning tokens with annotations or labels
+- Debugging or error reporting that points to specific text locations
+- Evaluating tokenization quality by comparing spans
+
+## The Issue in the Code
+
+In the `AugenblickTokenizer.encode()` method in `src/abctokz/tokenizer.py`, there was a bug in how offsets were calculated for subword tokenization (e.g., BPE). When a pre-token (such as a word) was split into multiple subword tokens, all tokens derived from the same pre-token were assigned the same offset span, which was the full span of the pre-token itself.
+
+For instance:
+- Input text: "ab"
+- Pre-tokenization: ["ab"]
+- Model tokenization (BPE): produces tokens ["a", "##b"]
+- Incorrect offsets: [(0, 2), (0, 2)] — both tokens get the same span as the pre-token "ab"
+
+This was incorrect because:
+- "a" should have offset (0, 1)
+- "##b" should have offset (1, 2)
+
+The bug occurred because the code used `len(pre_tok)` for every token's end position, instead of advancing a character cursor per token.
+
+## The Fix Applied
+
+The fix involved modifying the offset calculation loop in `AugenblickTokenizer.encode()` to:
+1. Compute the offset for each token based on its actual character length (after stripping the continuation prefix "##").
+2. Advance a running `char_offset` pointer by the token's length after each token.
+
+### Code Change in `src/abctokz/tokenizer.py`
+
+Before (incorrect):
+```python
+for tok_str, tok_id in pairs:
+    tok_len = len(tok_str.lstrip("##"))  # strip continuation prefix for offset
+    ids.append(tok_id)
+    tokens.append(tok_str)
+    offsets.append((char_offset, char_offset + len(pre_tok)))  # Wrong: always uses pre_tok length
+    is_special = int(tok_str in self._special_tokens)
+    special_mask.append(is_special)
+    attention_mask.append(1)
+```
+
+After (correct):
+```python
+for tok_str, tok_id in pairs:
+    tok_len = len(tok_str.lstrip("##"))  # strip continuation prefix for offset
+    ids.append(tok_id)
+    tokens.append(tok_str)
+    offsets.append((char_offset, char_offset + tok_len))  # Correct: uses token's actual length
+    is_special = int(tok_str in self._special_tokens)
+    special_mask.append(is_special)
+    attention_mask.append(1)
+    char_offset += tok_len  # Advance the cursor
+```
+
+This ensures that each token gets a precise offset matching its span in the normalized input string.
+
+## New Test File: `tests/unit/test_tokenizer_offsets.py`
+
+To prevent regression, a new unit test was added to verify the offset behavior. This test is important because:
+- It provides a concrete example of the bug and ensures it stays fixed.
+- It tests the specific case of subword tokenization where offsets were incorrect.
+- It can be run independently to validate the fix without requiring full integration tests.
+
+### Full Code of the Test File
+
+```python
+"""Unit tests for tokenizer token offsets."""
+
+from abctokz.tokenizer import AugenblickTokenizer
+from abctokz.models.bpe import BPEModel
+from abctokz.vocab.merges import MergeTable
+from abctokz.vocab.vocab import Vocabulary
+
+
+def test_tokenizer_offsets_align_with_tokens() -> None:
+    """Test that token offsets correctly align with subword token spans."""
+    vocab = Vocabulary({"<unk>": 0, "a": 1, "##b": 2})
+    model = BPEModel(vocab, MergeTable([]))
+    tokenizer = AugenblickTokenizer(model)
+
+    enc = tokenizer.encode("ab")
+    assert enc.tokens == ["a", "##b"]
+    assert enc.offsets == [(0, 1), (1, 2)]
+```
+
+### Explanation of the Test
+
+- **Setup**: Creates a minimal BPE model with vocabulary containing "a" and "##b" (no merges, so "ab" splits into these pieces).
+- **Execution**: Encodes the string "ab" using the tokenizer.
+- **Assertions**:
+  - `enc.tokens == ["a", "##b"]`: Verifies the expected tokenization.
+  - `enc.offsets == [(0, 1), (1, 2)]`: Ensures offsets are correct (0-1 for "a", 1-2 for "##b").
+- **Importance**: This test would fail on the original buggy code (offsets would be [(0, 2), (0, 2)]) and pass after the fix, providing clear evidence of correctness.
+
+## Evidence That the Fix Works
+
+The fix was validated by running the test code manually:
+
+```python
+from abctokz.tokenizer import AugenblickTokenizer
+from abctokz.models.bpe import BPEModel
+from abctokz.vocab.merges import MergeTable
+from abctokz.vocab.vocab import Vocabulary
+
+vocab = Vocabulary({"<unk>": 0, "a": 1, "##b": 2})
+model = BPEModel(vocab, MergeTable([]))
+tok = AugenblickTokenizer(model)
+enc = tok.encode("ab")
+print(enc.tokens, enc.offsets)  # Output: ['a', '##b'] [(0, 1), (1, 2)]
+assert enc.offsets == [(0, 1), (1, 2)]  # Passes
+```
+
+Before the fix, this would output `[(0, 2), (0, 2)]` and the assertion would fail.
+
+## Why This Fix is Right and Safe
+
+- **Minimal Change**: Only modifies the offset calculation logic; no changes to tokenization, training, or other features.
+- **Focused Impact**: Corrects a specific correctness issue without side effects.
+- **High Value**: Ensures offsets are accurate for subword models, enabling proper downstream usage.
+- **Tested**: Backed by a regression test to prevent future issues.
+
+
+```
+
+Tools Used:
 Shreya: 
 Chatgpt: 27027 Tokens
 Github Copilot: 42,200 Tokens
